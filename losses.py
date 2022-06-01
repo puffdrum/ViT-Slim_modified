@@ -63,6 +63,21 @@ class DistillationLoss(torch.nn.Module):
         loss = base_loss * (1 - self.alpha) + distillation_loss * self.alpha
         return loss
 
+#class SearchingDistillationLoss(torch.nn.Module):
+#    def __init__(self, base_criterion, device, attn_w=0.0001, mlp_w=0.0001, patch_w=0.0001):
+#        super().__init__()
+#        self.base_criterion = base_criterion
+#        self.w1 = attn_w
+#        self.w2 = mlp_w
+#        self.w3 = patch_w
+#        self.device = device
+#
+#    def forward(self, inputs, outputs, labels, model):
+#        base_loss = self.base_criterion(inputs, outputs, labels)
+#        sparsity_loss_attn, sparsity_loss_mlp, sparsity_loss_patch = model.module.get_sparsity_loss(self.device)
+#        return  base_loss + self.w1*sparsity_loss_attn + self.w2*sparsity_loss_mlp + self.w3*sparsity_loss_patch#
+
+
 class SearchingDistillationLoss(torch.nn.Module):
     def __init__(self, base_criterion, device, attn_w=0.0001, mlp_w=0.0001, patch_w=0.0001):
         super().__init__()
@@ -75,4 +90,58 @@ class SearchingDistillationLoss(torch.nn.Module):
     def forward(self, inputs, outputs, labels, model):
         base_loss = self.base_criterion(inputs, outputs, labels)
         sparsity_loss_attn, sparsity_loss_mlp, sparsity_loss_patch = model.module.get_sparsity_loss(self.device)
+        # discreteness_loss_attn, discreteness_loss_mlp, discreteness_loss_patch = model.module.get_discreteness_loss(self.device)
+        # return  base_loss + self.w1*(sparsity_loss_attn + discreteness_loss_attn) + self.w2*(sparsity_loss_mlp + discreteness_loss_mlp) + self.w3*(sparsity_loss_patch + discreteness_loss_patch)
         return  base_loss + self.w1*sparsity_loss_attn + self.w2*sparsity_loss_mlp + self.w3*sparsity_loss_patch
+
+
+class SearchingDistillationLossLayerWise(torch.nn.Module):
+    def __init__(self, base_criterion, device, w):
+        super().__init__()
+        self.base_criterion = base_criterion
+        self.w = w
+        self.device = device
+
+    def forward(self, inputs, outputs, labels, model):
+        base_loss = self.base_criterion(inputs, outputs, labels)
+        sparsity_loss_layerwise = model.module.get_sparsity_loss_layerwise(self.device, self.w)
+        
+        return  base_loss + sparsity_loss_layerwise
+
+
+class SearchingDistillationLossChannelWise(torch.nn.Module):
+    def __init__(self, base_criterion, device, w):
+        super().__init__()
+        self.base_criterion = base_criterion
+        self.w = w
+        self.device = device
+
+    def forward(self, inputs, outputs, labels, model):
+        base_loss = self.base_criterion(inputs, outputs, labels)
+        sparsity_loss_channelwise = model.module.get_sparsity_loss_channelwise(self.device, self.w)
+        
+        return  base_loss + sparsity_loss_channelwise
+
+
+class LossRegZero(torch.nn.Module):
+    def __init__(self, device, w):
+        super().__init__()
+        self.w = w
+        self.device = device
+
+    def forward(self, model):
+        loss_regularization_zero = model.module.get_sparsity_loss_channelwise(self.device, self.w)
+        
+        return  loss_regularization_zero
+
+class LossRegOne(torch.nn.Module):
+    def __init__(self, device, w):
+        super().__init__()
+        self.w = w
+        self.device = device
+
+    def forward(self, model):
+        loss_regularization_one = model.module.get_sparsity_loss_channelwise_one(self.device, self.w)
+        
+        return  loss_regularization_one
+

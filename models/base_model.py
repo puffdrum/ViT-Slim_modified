@@ -54,7 +54,113 @@ class BaseModel(nn.Module):
                 loss_patch = torch.cat([loss_patch, torch.abs(zeta_patch.view(-1))])
             else:
                 loss_mlp = torch.cat([loss_mlp, torch.abs(l_block.get_zeta().view(-1))])
+        return torch.sum(loss_attn).to(device), torch.sum(loss_mlp).to(device), torch.sum(loss_patch).to(device)
+
+    def get_sparsity_loss_layerwise(self, device, w):
+        loss_attn = torch.FloatTensor([]).to(device)
+        loss_mlp = torch.FloatTensor([]).to(device)
+        loss_patch = torch.FloatTensor([]).to(device)
+        for l_block in self.searchable_modules:
+            if hasattr(l_block, 'num_heads'):
+                zeta_attn, zeta_patch = l_block.get_zeta()
+                loss_attn = torch.cat([loss_attn.to(device), torch.FloatTensor([torch.sum(torch.abs(zeta_attn.view(-1)))]).to(device)])
+                loss_patch = torch.cat([loss_patch.to(device), torch.FloatTensor([torch.sum(torch.abs(zeta_patch.view(-1)))]).to(device)])
+            else:
+                loss_mlp = torch.cat([loss_mlp.to(device), torch.FloatTensor([torch.sum(torch.abs(l_block.get_zeta().view(-1)))]).to(device)])
+        
+        loss_layerwise = torch.FloatTensor([]).to(device)
+        loss_layerwise = torch.cat([loss_layerwise, loss_attn, loss_mlp, loss_patch])
+        loss_layerwise = torch.FloatTensor(w).to(device)*loss_layerwise
+        return torch.sum(loss_layerwise).to(device)
+    
+    def get_sparsity_loss_channelwise(self, device, w):
+        loss_attn = torch.FloatTensor([]).to(device)
+        loss_mlp = torch.FloatTensor([]).to(device)
+        loss_patch = torch.FloatTensor([]).to(device)
+        for l_block in self.searchable_modules:
+            if hasattr(l_block, 'num_heads'):
+                zeta_attn, zeta_patch = l_block.get_zeta()
+                loss_attn = torch.cat([loss_attn.to(device), torch.abs(zeta_attn.view(-1)).to(device)])
+                loss_patch = torch.cat([loss_patch.to(device), torch.abs(zeta_patch.view(-1)).to(device)])
+            else:
+                loss_mlp = torch.cat([loss_mlp.to(device), torch.abs(l_block.get_zeta().view(-1)).to(device)])
+        
+        loss_channelwise = torch.FloatTensor([]).to(device)
+        loss_channelwise = torch.cat([loss_channelwise, loss_attn, loss_mlp, loss_patch])
+        loss_channelwise = torch.FloatTensor(w).to(device)*loss_channelwise
+        return torch.sum(loss_channelwise).to(device)
+
+    def get_sparsity_loss_channelwise_one(self, device, w):
+        loss_attn = torch.FloatTensor([]).to(device)
+        loss_mlp = torch.FloatTensor([]).to(device)
+        loss_patch = torch.FloatTensor([]).to(device)
+        for l_block in self.searchable_modules:
+            if hasattr(l_block, 'num_heads'):
+                zeta_attn, zeta_patch = l_block.get_zeta()
+                loss_attn = torch.cat([loss_attn.to(device), torch.abs(torch.abs(torch.sub(zeta_attn.view(-1), 1))).to(device)])
+                loss_patch = torch.cat([loss_patch.to(device), torch.abs(torch.abs(torch.sub(zeta_patch.view(-1), 1))).to(device)])
+            else:
+                loss_mlp = torch.cat([loss_mlp.to(device), torch.abs(torch.abs(torch.sub(l_block.get_zeta().view(-1), 1))).to(device)])
+        
+        loss_channelwise = torch.FloatTensor([]).to(device)
+        loss_channelwise = torch.cat([loss_channelwise, loss_attn, loss_mlp, loss_patch])
+        loss_channelwise = torch.FloatTensor(w).to(device)*loss_channelwise
+        return torch.sum(loss_channelwise).to(device)
+
+    def get_discreteness_loss(self, device):
+        loss_attn = torch.FloatTensor([]).to(device)
+        loss_mlp = torch.FloatTensor([]).to(device)
+        loss_patch = torch.FloatTensor([]).to(device)
+        for l_block in self.searchable_modules:
+            if hasattr(l_block, 'num_heads'):
+                zeta_attn, zeta_patch = l_block.get_zeta()
+                loss_attn = torch.cat([loss_attn, torch.abs(zeta_attn.view(-1))])
+                loss_patch = torch.cat([loss_patch, torch.abs(zeta_patch.view(-1))])
+            else:
+                loss_mlp = torch.cat([loss_mlp, torch.abs(l_block.get_zeta().view(-1))])
+        
+        loss_attn = torch.min(torch.abs(torch.sub(loss_attn,1)), torch.abs(loss_attn))
+        loss_patch = torch.min(torch.abs(torch.sub(loss_patch,1)), torch.abs(loss_patch))
+        loss_mlp = torch.min(torch.abs(torch.sub(loss_mlp,1)), torch.abs(loss_mlp))
+
         return torch.sum(loss_attn).to(device), torch.sum(loss_mlp).to(device), torch.sum(loss_patch).to(device)  
+
+    def add_hooks_zetas(self, grad_masks, device):
+        masks_attn = grad_masks[0]
+        masks_mlp = grad_masks[1]
+        masks_patch = grad_masks[2]
+        cnt_attn = 0
+        cnt_mlp = 0
+        cnt_patch = 0
+        hooks_attn = []
+        hooks_mlp = []
+        hooks_patch = []
+        for l_block in self.searchable_modules:
+            if hasattr(l_block, 'num_heads'):
+                zeta_attn, zeta_patch = l_block.get_zeta()
+                mask_attn_tensor = torch.tensor(masks_attn[cnt_attn]).reshape(zeta_attn.size())
+                mask_patch_tensor = torch.tensor(masks_patch[cnt_attn]).reshape(zeta_patch.size())
+                cnt_attn += 1
+                cnt_patch += 1
+                hook_attn = zeta_attn.register_hook(lambda grad: grad.mul_(mask_attn_tensor.to(device)))
+                hook_patch = zeta_patch.register_hook(lambda grad: grad.mul_(mask_patch_tensor.to(device)))
+                hooks_attn.append(hook_attn)
+                hooks_patch.append(hook_patch)
+            else:
+                zeta_mlp = l_block.get_zeta()
+                mask_mlp_tensor = torch.tensor(masks_mlp[cnt_mlp]).reshape(zeta_mlp.size())
+                cnt_mlp += 1
+                hook_mlp = zeta_mlp.register_hook(lambda grad: grad.mul_(mask_mlp_tensor.to(device)))
+                hooks_mlp.append(hook_mlp)
+        return hooks_attn, hooks_mlp, hooks_patch
+
+    def remove_hooks_zetas(self, hooks_attn, hooks_mlp, hooks_patch):
+        for hook_attn in hooks_attn:
+            hook_attn.remove()
+        for hook_mlp in hooks_mlp:
+            hook_mlp.remove()
+        for hook_patch in hooks_patch:
+            hook_patch.remove()
 
     def give_zetas(self):
         zetas_attn = []
@@ -84,21 +190,66 @@ class BaseModel(nn.Module):
             else:
                 zetas_mlp.append(l_block.get_zeta().cpu().detach().reshape(-1).numpy().tolist())
         return zetas_attn, zetas_mlp, zetas_patch
-    
-    def update_zetas_SA(self, new_zetas):
-        idx_attn = 0
-        idx_patch = 0
-        idx_mlp = 0
+
+    def give_zetas_channelwise(self):
+        zetas_attn = []
+        zetas_mlp = []
+        zetas_patch = []
         for l_block in self.searchable_modules:
             if hasattr(l_block, 'num_heads'):
                 zeta_attn, zeta_patch = l_block.get_zeta()
-                zeta_attn = torch.reshape(torch.Tensor(new_zetas[0][idx_attn], dtype=zeta_attn.dtype, device=zeta_attn.device, requires_grad=zeta_attn.requires_grad), zeta_attn.shape)
-                zetas_patch = torch.reshape(torch.Tensor(new_zetas[2][idx_patch], dtype=zetas_patch.dtype, device=zetas_patch.device, requires_grad=zetas_patch.requires_grad), zetas_patch.shape)
-                idx_attn += 1
-                idx_patch += 1
+                zetas_attn.append(zeta_attn.cpu().detach().reshape(-1).numpy().tolist())
+                zetas_patch.append(zeta_patch.cpu().detach().reshape(-1).numpy().tolist())
             else:
-                zetas_mlp = torch.reshape(torch.Tensor(new_zetas[1][idx_patch], dtype=zetas_patch.dtype, device=zetas_patch.device, requires_grad=zetas_patch.requires_grad), zetas_mlp.shape)
-                idx_attn += 1
+                zetas_mlp.append(l_block.get_zeta().cpu().detach().reshape(-1).numpy().tolist())
+        zetas_attn = [z for k in zetas_attn for z in k ]
+        zetas_mlp = [z for k in zetas_mlp for z in k ]
+        zetas_patch = [z for k in zetas_patch for z in k ]
+        zetas = []
+        zetas.extend(zetas_attn)
+        zetas.extend(zetas_mlp)
+        zetas.extend(zetas_patch)
+        return zetas
+
+    def give_pis_layerwise(self):
+        pis_attn = []
+        pis_mlp = []
+        pis_patch = []
+        for l_block in self.searchable_modules:
+            if hasattr(l_block, 'num_heads'):
+                zeta_attn, zeta_patch = l_block.get_zeta()
+                l_attn = zeta_attn.cpu().detach().reshape(-1).numpy().tolist()
+                l_patch = zeta_patch.cpu().detach().reshape(-1).numpy().tolist()
+                pi_attn = np.mean(list(map(np.exp, l_attn)))
+                pi_patch = np.mean(list(map(np.exp, l_patch)))
+                pis_attn.append(pi_attn)
+                pis_patch.append(pi_patch)
+            else:
+                l_mlp = l_block.get_zeta().cpu().detach().reshape(-1).numpy().tolist()
+                pi_mlp = np.mean(list(map(np.exp, l_mlp)))
+                pis_mlp.append(pi_mlp)
+        return pis_attn, pis_mlp, pis_patch
+
+    def give_pis_channelwise(self):
+        zetas_attn = []
+        zetas_mlp = []
+        zetas_patch = []
+        for l_block in self.searchable_modules:
+            if hasattr(l_block, 'num_heads'):
+                zeta_attn, zeta_patch = l_block.get_zeta()
+                zetas_attn.append(zeta_attn.cpu().detach().reshape(-1).numpy().tolist())
+                zetas_patch.append(zeta_patch.cpu().detach().reshape(-1).numpy().tolist())
+            else:
+                zetas_mlp.append(l_block.get_zeta().cpu().detach().reshape(-1).numpy().tolist())
+        zetas_attn = [z for k in zetas_attn for z in k ]
+        zetas_mlp = [z for k in zetas_mlp for z in k ]
+        zetas_patch = [z for k in zetas_patch for z in k ]
+
+        pis_attn = list(map(np.exp, zetas_attn))
+        pis_mlp = list(map(np.exp, zetas_mlp))
+        pis_patch = list(map(np.exp, zetas_patch))
+
+        return pis_attn, pis_mlp, pis_patch
 
     def plot_zt(self):
         """plots the distribution of zeta_t and returns the same"""

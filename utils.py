@@ -240,37 +240,114 @@ def init_distributed_mode(args):
     torch.distributed.barrier()
     setup_for_distributed(args.rank == 0)
 
-def simulated_annealing_sparse_layerwise(pre_zetas, cur_zetas, cur_epoch, total_epochs):
-    T=cur_epoch/(total_epochs+1)
-    pre_sum_total = 0
-    cur_sum_total = 0
-    pre_sum_layerwise = []
-    cur_sum_layerwise = []
-    for i in range(len(pre_zetas)):
-        pre_sum_ele = []
-        cur_sum_ele = []
-        for j in range(len(pre_zetas[i])):
-            pre_sum = float(sum(pre_zetas[i][j], 0))
-            pre_sum_total += pre_sum
-            pre_sum_ele.append(pre_sum)
-            cur_sum = float(sum(cur_zetas[i][j], 0))
-            cur_sum_total += cur_sum
-            cur_sum_ele.append(cur_sum)
-        pre_sum_layerwise.append(pre_sum_ele)
-        cur_sum_layerwise.append(cur_sum_ele)
 
-    zetas_search = copy.deepcopy(cur_zetas)
-    for i in range(len(zetas_search)):
-        for j in range(len(zetas_search[i])):
-            delt_f = pre_sum_layerwise[i][j]/pre_sum_total - cur_sum_layerwise[i][j]/cur_sum_total
-            for zeta in zetas_search:
-                new_zeta = zeta + np.random.uniform(low=-0.000002, high=0.000002)*T
-                if (0.00001<=new_zeta and new_zeta<=0.0007):
-                    if delt_f > 0:
-                        zeta=new_zeta
-                    else:
-                        Pchange = math.exp((delt_f)*160/T)
-                        Punchange = np.random.uniform(low=0, high=1)
-                        if Punchange<Pchange:
-                            zeta=new_zeta
-    return zetas_search
+def simulated_annealing_sparse_layerwise(pre_pis, cur_pis, w, cur_epoch, total_epochs):
+    pre_sum = 0
+    cur_sum = 0
+    for i in range(len(w)):
+        pre_sum+=pre_pis[i]
+        cur_sum+=cur_pis[i]
+    
+    pre_pis_layerwise = []
+    cur_pis_layerwise = []
+    for i in range(len(w)):
+        pre_pis_layerwise.append(pre_pis[i]/pre_sum)
+        cur_pis_layerwise.append(cur_pis[i]/cur_sum)
+    
+    T = cur_epoch/(total_epochs+1)
+    for i in range(len(w)):
+        w_new = w[i] + np.random.uniform(low=-0.000002, high=0.000002)*T
+        if (0.00001<=w_new and w_new<=0.0007):
+            delta_pi = cur_pis_layerwise[i] - pre_pis_layerwise[i]
+            if delta_pi>0:
+                w[i] = w_new
+            elif pre_pis[i]*0.0005+delta_pi <= 0:
+                pChange = np.random.uniform(low=0, high=1)
+                if pChange>0.5:
+                    w[i] = w_new
+            else:
+                pAccept = math.exp(138.63*(delta_pi)*total_epochs/T)
+                pChange = np.random.uniform(low=0, high=1)
+                if pChange < pAccept:
+                    w[i] = w_new
+    return w
+
+
+def simulated_annealing_sparse_channelwise(pre_pis, cur_pis, w, cur_epoch, total_epochs):
+    pre_sum = 0
+    cur_sum = 0
+    for i in range(len(w)):
+        pre_sum+=pre_pis[i]
+        cur_sum+=cur_pis[i]
+    
+    pre_pis_channelwise = []
+    cur_pis_channelwise = []
+    for i in range(len(w)):
+        pre_pis_channelwise.append(pre_pis[i]/pre_sum)
+        cur_pis_channelwise.append(cur_pis[i]/cur_sum)
+    
+    T = cur_epoch/(total_epochs+1)
+    for i in range(len(w)):
+        w_new = w[i] + np.random.uniform(low=-0.000002, high=0.000002)*T
+        if (0.00001<=w_new and w_new<=0.0007):
+            delta_pi = cur_pis_channelwise[i] - pre_pis_channelwise[i]
+            if delta_pi>0:
+                w[i] = w_new
+            elif pre_pis[i]*0.0005+delta_pi <= 0:
+                pChange = np.random.uniform(low=0, high=1)
+                if pChange>0.5:
+                    w[i] = w_new
+            else:
+                pAccept = math.exp(138.63*(delta_pi)*total_epochs/T)
+                pChange = np.random.uniform(low=0, high=1)
+                if pChange < pAccept:
+                    w[i] = w_new
+    return w
+
+def update_bp_methods(zetas_attn, zetas_mlp, zetas_patch, bp_methods, ft, rt):
+    for layer in range(len(zetas_attn)):
+        for index in range(len(zetas_attn[layer])):
+            if bp_methods[0][layer][index] == 0:
+                if zetas_attn[layer][index] <= ft:
+                    bp_methods[0][layer][index] = -1
+                if zetas_attn[layer][index] > rt:
+                    bp_methods[0][layer][index] = 1
+    for layer in range(len(zetas_mlp)):
+        for index in range(len(zetas_mlp[layer])):
+            if bp_methods[1][layer][index] == 0:
+                if zetas_mlp[layer][index] <= ft:
+                    bp_methods[1][layer][index] = -1
+                if zetas_mlp[layer][index] > rt:
+                    bp_methods[1][layer][index] = 1
+    for layer in range(len(zetas_patch)):
+        for index in range(len(zetas_patch[layer])):
+            if bp_methods[2][layer][index] == 0:
+                if zetas_patch[layer][index] <= ft:
+                    bp_methods[2][layer][index] = -1
+                if zetas_patch[layer][index] > rt:
+                    bp_methods[2][layer][index] = 1
+    
+    return bp_methods
+
+def generate_criterion_w(bp_methods, w, value):
+    w_train = []
+    w_train_attn = [w[0] if method == value else 0 for methods in bp_methods[0] for method in methods]
+    w_train_mlp = [w[1] if method == value else 0 for methods in bp_methods[1] for method in methods]
+    w_train_patch = [w[2] if method == value else 0 for methods in bp_methods[2] for method in methods]
+    w_train.extend(w_train_attn)
+    w_train.extend(w_train_mlp)
+    w_train.extend(w_train_patch)
+
+    return w_train
+
+def update_grad_masks(grad_masks, bp_methods):
+    for layers in range(len(bp_methods)):
+        for layer in range(len(bp_methods[layers])):
+            for channel in range(len(bp_methods[layers][layer])):
+                if bp_methods[layers][layer][channel] == 0:
+                    grad_masks[layers][layer][channel] = 1
+                else:
+                    grad_masks[layers][layer][channel] = 0
+
+    return grad_masks
+

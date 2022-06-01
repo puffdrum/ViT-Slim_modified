@@ -18,11 +18,11 @@ from timm.utils import NativeScaler, get_state_dict, ModelEma
 
 from datasets import build_dataset
 from engine import train_one_epoch, evaluate
-from losses import DistillationLoss, SearchingDistillationLoss
+from losses import DistillationLoss, SearchingDistillationLoss, SearchingDistillationLossChannelWise
 from samplers import RASampler
 import models
 import utils
-from utils import simulated_annealing_sparse_layerwise
+from utils import simulated_annealing_sparse_channelwise
 import matplotlib.pyplot as plt
 
 def get_args_parser():
@@ -317,21 +317,34 @@ def main(args):
     criterion = DistillationLoss(
         criterion, teacher_model, args.distillation_type, args.distillation_alpha, args.distillation_tau
     )
-    criterion = SearchingDistillationLoss(
-        criterion, device, attn_w=args.w1, mlp_w=args.w2, patch_w=args.w3
-    )
+    #criterion = SearchingDistillationLoss(
+    #    criterion, device, attn_w=args.w1, mlp_w=args.w2, patch_w=args.w3
+    #)
 
     output_dir = Path(args.output_dir)
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     max_soft_accuracy = 0.0
+    
+    pis_attn, pis_mlp, pis_patch = model.module.give_pis_channelwise()
+    w_attn = [args.w1 for n in range(len(pis_attn))]
+    w_mlp = [args.w2 for n in range(len(pis_mlp))]
+    w_patch = [args.w3 for n in range(len(pis_patch))]
+    w = []
+    w.extend(w_attn)
+    w.extend(w_mlp)
+    w.extend(w_patch)
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
-
+        
+        criterion_train = SearchingDistillationLossChannelWise(
+            criterion, device, w=w
+        )
         train_stats = train_one_epoch(
-            model, criterion, data_loader_train,
+            model, criterion_train, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             args.clip_grad, model_ema, mixup_fn, use_amp=False
         )
@@ -373,20 +386,21 @@ def main(args):
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
+        
+        pis_attn, pis_mlp, pis_patch = model.module.give_pis_channelwise()
+        cur_pis = []
+        cur_pis.extend(pis_attn)
+        cur_pis.extend(pis_mlp)
+        cur_pis.extend(pis_patch)
+        if epoch>0:
+            w = simulated_annealing_sparse_channelwise(pre_pis, cur_pis, w, epoch, args.epochs)
+        pre_pis = cur_pis
 
         zetas = model.module.give_zetas()
         a=plt.hist(zetas, bins=1000)
         path = output_dir / f'zetas_{epoch}.png'
         plt.savefig(path)
         plt.clf()
-
-        #zetas_attn, zetas_mlp, zetas_patch = model.module.give_zetas_layerwise()
-        #cur_zetas = [zetas_attn, zetas_mlp, zetas_patch]
-        #if epoch>5:
-        #    zetas_search = simulated_annealing_sparse_layerwise(pre_zetas, cur_zetas, epoch, args.epochs)
-        #    model.module.update_zetas_SA(zetas_search)
-
-        #pre_zetas = cur_zetas
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

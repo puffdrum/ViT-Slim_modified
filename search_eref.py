@@ -13,22 +13,22 @@ from timm.data import Mixup
 from timm.models import create_model
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.scheduler import create_scheduler
-from timm.optim import create_optimizer
+from timm.optim import create_optimizer, create_optimizer_v2
 from timm.utils import NativeScaler, get_state_dict, ModelEma
 
 from datasets import build_dataset
-from engine import train_one_epoch, evaluate
-from losses import DistillationLoss, SearchingDistillationLoss
+from engine import train_one_epoch, train_one_epoch_partialbp, evaluate
+from losses import DistillationLoss, SearchingDistillationLoss, SearchingDistillationLossChannelWise, LossRegZero, LossRegOne
 from samplers import RASampler
 import models
 import utils
-from utils import simulated_annealing_sparse_layerwise
+from utils import simulated_annealing_sparse_layerwise, update_bp_methods, generate_criterion_w, update_grad_masks
 import matplotlib.pyplot as plt
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DeiT training and evaluation script', add_help=False)
     parser.add_argument('--batch-size', default=64, type=int)
-    parser.add_argument('--epochs', default=50, type=int)
+    parser.add_argument('--epochs', default=80, type=int)
 
     # Model parameters
     parser.add_argument('--model', default='deit_base_patch16_224', type=str, metavar='MODEL',
@@ -168,11 +168,19 @@ def get_args_parser():
     parser.add_argument('--head_search', action='store_true')
     parser.add_argument('--uniform_search', action='store_true')
     parser.add_argument('--freeze_weights', action='store_true')
+    parser.add_argument('--pre_epochs', default=10, type=int, help='epochs for pre sparse')
+    parser.add_argument('--fs_epochs', default=20, type=int, help='epochs for final sparse')
+    parser.add_argument('--ms_times', default=3, type=int, help='times for mix and sparse')
+    parser.add_argument('--m_epochs', default=10, type=int, help='epochs for mix')
+    parser.add_argument('--s_epochs', default=10, type=int, help='epochs for sparse')
+    parser.add_argument('--ft', default=0.1, type=float, help='threshold for forgetting')
+    parser.add_argument('--rt', default=0.5, type=float, help='threshold for remembering')
     return parser
 
 
 def main(args):
     utils.init_distributed_mode(args)
+    args.epochs=args.pre_epochs+args.ms_times*2*(args.m_epochs+args.s_epochs)+args.fs_epochs
     print(args)
     args.w1/=args.world_size
     args.w2/=args.world_size
@@ -279,6 +287,8 @@ def main(args):
     print('number of params:', n_parameters)
 
     optimizer = create_optimizer(args, model_without_ddp)
+    optimizer0 = create_optimizer(args, model_without_ddp)
+    optimizer1 = create_optimizer(args, model_without_ddp)
     loss_scaler = NativeScaler()
 
     lr_scheduler, _ = create_scheduler(args, optimizer)
@@ -317,24 +327,112 @@ def main(args):
     criterion = DistillationLoss(
         criterion, teacher_model, args.distillation_type, args.distillation_alpha, args.distillation_tau
     )
-    criterion = SearchingDistillationLoss(
-        criterion, device, attn_w=args.w1, mlp_w=args.w2, patch_w=args.w3
-    )
+    #criterion = SearchingDistillationLoss(
+    #    criterion, device, attn_w=args.w1, mlp_w=args.w2, patch_w=args.w3
+    #)
+    #criterion = SearchingDistillationLossLayerWise(
+    #    criterion, device, attn_w=args.w1, mlp_w=args.w2, patch_w=args.w3
+    #)
 
     output_dir = Path(args.output_dir)
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     max_soft_accuracy = 0.0
+    
+    zetas_attn, zetas_mlp, zetas_patch = model.module.give_zetas() # [[], [], []]
+    # coefficients for L1-regularization loss
+    w_attn = [args.w1 for n in range(len(zetas_attn))]
+    w_mlp = [args.w2 for n in range(len(zetas_mlp))]
+    w_patch = [args.w3 for n in range(len(zetas_patch))]
+    w = []
+    w.extend(w_attn)
+    w.extend(w_mlp)
+    w.extend(w_patch)
+    init_w = [args.w1, args.w2, args.w3]
+    
+    zetas_attn, zetas_mlp, zetas_patch = model.module.give_zetas_layerwise() # [[[],[],...], [[],[],...], [[],[],...]]
+    # grad_masks for partial bp of zetas
+    grad_masks_attn = [[1 for x in range(len(n))] for n in zetas_attn]
+    grad_masks_mlp = [[1 for x in range(len(n))] for n in zetas_mlp]
+    grad_masks_patch = [[1 for x in range(len(n))] for n in zetas_patch]
+    grad_masks = [grad_masks_attn, grad_masks_mlp, grad_masks_patch]
+
+    # bp_methods for zetas: -1: w*||z||; 1: w*||z-1||; 0: w*||z||+L(accuracy)
+    bp_methods_attn = [[0 for x in range(len(n))] for n in zetas_attn]
+    bp_methods_mlp = [[0 for x in range(len(n))] for n in zetas_mlp]
+    bp_methods_patch = [[0 for x in range(len(n))] for n in zetas_patch]
+    bp_methods = [bp_methods_attn, bp_methods_mlp, bp_methods_patch]
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
-
-        train_stats = train_one_epoch(
-            model, criterion, data_loader_train,
-            optimizer, device, epoch, loss_scaler,
-            args.clip_grad, model_ema, mixup_fn, use_amp=False
-        )
+        if epoch<args.pre_epochs:
+            # pre sparse stage, finished
+            criterion_train = SearchingDistillationLossChannelWise(
+                criterion, device, w=w
+            )
+            train_stats = train_one_epoch(
+                model, criterion_train, data_loader_train,
+                optimizer, device, epoch, loss_scaler,
+                args.clip_grad, model_ema, mixup_fn, use_amp=False
+            )
+        elif epoch>=args.epochs-args.fs_epochs:
+            # final sparse stage, finished
+            if epoch == args.epochs-args.fs_epochs:
+                # update bp_methods
+                zetas_attn, zetas_mlp, zetas_patch = model.module.give_zetas_layerwise() # [[[],[],...], [[],[],...], [[],[],...]]
+                bp_methods = update_bp_methods(zetas_attn, zetas_mlp, zetas_patch, bp_methods, args.ft, args.ft)
+                # generate coefficients for losses
+                w_accuracy = generate_criterion_w(bp_methods, init_w, 0)
+                w_regzero = generate_criterion_w(bp_methods, init_w, -1)
+                w_regone = generate_criterion_w(bp_methods, init_w, 1)
+                # generate masks for partial regularization bp
+                grad_masks = update_grad_masks(grad_masks, bp_methods)
+                # generate losses
+                criterion_accuracy = SearchingDistillationLossChannelWise(criterion, device, w=w_accuracy)
+                criterion_regzero = LossRegZero(device, w=w_regzero)
+                criterion_regone = LossRegOne(device, w=w_regone)
+            # train
+            train_stats = train_one_epoch_partialbp(
+                model, criterion_accuracy, criterion_regzero, 
+                criterion_regone, grad_masks, data_loader_train,
+                optimizer, optimizer0, optimizer1, device, epoch, loss_scaler,
+                args.clip_grad, model_ema, mixup_fn, use_amp=False
+            )
+        elif ((epoch-args.pre_epochs)//10)%2 == 0:
+            # middle mix stage
+            if (epoch-args.pre_epochs)%(args.m_epochs+args.s_epochs) == 0:
+                # update bp_methods
+                zetas_attn, zetas_mlp, zetas_patch = model.module.give_zetas_layerwise() # [[[],[],...], [[],[],...], [[],[],...]]
+                bp_methods = update_bp_methods(zetas_attn, zetas_mlp, zetas_patch, bp_methods, args.ft, args.rt)
+                # generate coefficients for losses
+                w_accuracy = generate_criterion_w(bp_methods, init_w, 0)
+                w_regzero = generate_criterion_w(bp_methods, init_w, -1)
+                w_regone = generate_criterion_w(bp_methods, init_w, 1)
+                # generate masks for partial regularization bp
+                grad_masks = update_grad_masks(grad_masks, bp_methods)
+                # generate losses
+                criterion_accuracy = criterion
+                criterion_regzero = LossRegZero(device, w=w_regzero)
+                criterion_regone = LossRegOne(device, w=w_regone)
+            # train
+            train_stats = train_one_epoch_partialbp(
+                model, criterion_accuracy, criterion_regzero, 
+                criterion_regone, grad_masks, data_loader_train,
+                optimizer, optimizer0, optimizer1, device, epoch, loss_scaler,
+                args.clip_grad, model_ema, mixup_fn, use_amp=False
+            )
+        else:
+            # middle sparse stage
+            # train
+            train_stats = train_one_epoch_partialbp(
+                model, criterion_accuracy, criterion_regzero, 
+                criterion_regone, grad_masks, data_loader_train,
+                optimizer, optimizer0, optimizer1, device, epoch, loss_scaler,
+                args.clip_grad, model_ema, mixup_fn, use_amp=False
+            )
+        
         if args.output_dir:
             checkpoint_paths = [output_dir / 'running_ckpt.pth']
             for checkpoint_path in checkpoint_paths:
