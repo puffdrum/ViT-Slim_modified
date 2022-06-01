@@ -13,6 +13,9 @@ import datetime
 
 import torch
 import torch.distributed as dist
+import math
+import copy
+import numpy as np
 
 
 class SmoothedValue(object):
@@ -236,3 +239,38 @@ def init_distributed_mode(args):
                                          world_size=args.world_size, rank=args.rank)
     torch.distributed.barrier()
     setup_for_distributed(args.rank == 0)
+
+def simulated_annealing_sparse_layerwise(pre_zetas, cur_zetas, cur_epoch, total_epochs):
+    T=cur_epoch/(total_epochs+1)
+    pre_sum_total = 0
+    cur_sum_total = 0
+    pre_sum_layerwise = []
+    cur_sum_layerwise = []
+    for i in range(len(pre_zetas)):
+        pre_sum_ele = []
+        cur_sum_ele = []
+        for j in range(len(pre_zetas[i])):
+            pre_sum = float(sum(pre_zetas[i][j], 0))
+            pre_sum_total += pre_sum
+            pre_sum_ele.append(pre_sum)
+            cur_sum = float(sum(cur_zetas[i][j], 0))
+            cur_sum_total += cur_sum
+            cur_sum_ele.append(cur_sum)
+        pre_sum_layerwise.append(pre_sum_ele)
+        cur_sum_layerwise.append(cur_sum_ele)
+
+    zetas_search = copy.deepcopy(cur_zetas)
+    for i in range(len(zetas_search)):
+        for j in range(len(zetas_search[i])):
+            delt_f = pre_sum_layerwise[i][j]/pre_sum_total - cur_sum_layerwise[i][j]/cur_sum_total
+            for zeta in zetas_search:
+                new_zeta = zeta + np.random.uniform(low=-0.000002, high=0.000002)*T
+                if (0.00001<=new_zeta and new_zeta<=0.0007):
+                    if delt_f > 0:
+                        zeta=new_zeta
+                    else:
+                        Pchange = math.exp((delt_f)*160/T)
+                        Punchange = np.random.uniform(low=0, high=1)
+                        if Punchange<Pchange:
+                            zeta=new_zeta
+    return zetas_search

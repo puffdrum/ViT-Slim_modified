@@ -1,5 +1,6 @@
 import argparse
 import datetime
+from turtle import update
 import numpy as np
 import time
 import torch
@@ -21,6 +22,7 @@ from losses import DistillationLoss, SearchingDistillationLoss
 from samplers import RASampler
 import models
 import utils
+from utils import simulated_annealing_sparse_layerwise
 import matplotlib.pyplot as plt
 
 def get_args_parser():
@@ -377,6 +379,14 @@ def main(args):
         path = output_dir / f'zetas_{epoch}.png'
         plt.savefig(path)
         plt.clf()
+
+        zetas_attn, zetas_mlp, zetas_patch = model.module.give_zetas_layerwise()
+        cur_zetas = [zetas_attn, zetas_mlp, zetas_patch]
+        if epoch>5:
+            zetas_search = simulated_annealing_sparse_layerwise(pre_zetas, cur_zetas, epoch, args.epochs)
+            model.module.update_zetas_SA(zetas_search)
+
+        pre_zetas = cur_zetas
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

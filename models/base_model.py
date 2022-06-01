@@ -72,6 +72,34 @@ class BaseModel(nn.Module):
         zetas_patch = [z for k in zetas_patch for z in k ]
         return zetas_attn, zetas_mlp, zetas_patch
 
+    def give_zetas_layerwise(self):
+        zetas_attn = []
+        zetas_mlp = []
+        zetas_patch = []
+        for l_block in self.searchable_modules:
+            if hasattr(l_block, 'num_heads'):
+                zeta_attn, zeta_patch = l_block.get_zeta()
+                zetas_attn.append(zeta_attn.cpu().detach().reshape(-1).numpy().tolist())
+                zetas_patch.append(zeta_patch.cpu().detach().reshape(-1).numpy().tolist())
+            else:
+                zetas_mlp.append(l_block.get_zeta().cpu().detach().reshape(-1).numpy().tolist())
+        return zetas_attn, zetas_mlp, zetas_patch
+    
+    def update_zetas_SA(self, new_zetas):
+        idx_attn = 0
+        idx_patch = 0
+        idx_mlp = 0
+        for l_block in self.searchable_modules:
+            if hasattr(l_block, 'num_heads'):
+                zeta_attn, zeta_patch = l_block.get_zeta()
+                zeta_attn = torch.reshape(torch.Tensor(new_zetas[0][idx_attn], dtype=zeta_attn.dtype, device=zeta_attn.device, requires_grad=zeta_attn.requires_grad), zeta_attn.shape)
+                zetas_patch = torch.reshape(torch.Tensor(new_zetas[2][idx_patch], dtype=zetas_patch.dtype, device=zetas_patch.device, requires_grad=zetas_patch.requires_grad), zetas_patch.shape)
+                idx_attn += 1
+                idx_patch += 1
+            else:
+                zetas_mlp = torch.reshape(torch.Tensor(new_zetas[1][idx_patch], dtype=zetas_patch.dtype, device=zetas_patch.device, requires_grad=zetas_patch.requires_grad), zetas_mlp.shape)
+                idx_attn += 1
+
     def plot_zt(self):
         """plots the distribution of zeta_t and returns the same"""
         zetas_attn, zetas_mlp, zetas_patch = self.give_zetas()
