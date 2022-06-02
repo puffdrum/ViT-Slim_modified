@@ -13,7 +13,7 @@ from timm.data import Mixup
 from timm.models import create_model
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.scheduler import create_scheduler
-from timm.optim import create_optimizer, create_optimizer_v2
+from timm.optim import create_optimizer
 from timm.utils import NativeScaler, get_state_dict, ModelEma
 
 from datasets import build_dataset
@@ -22,13 +22,13 @@ from losses import DistillationLoss, SearchingDistillationLoss, SearchingDistill
 from samplers import RASampler
 import models
 import utils
-from utils import simulated_annealing_sparse_layerwise, update_bp_methods, generate_criterion_w, update_grad_masks
+from utils import update_bp_methods, generate_criterion_w, update_grad_masks, read_list_2d_int, save_list_2d_int
 import matplotlib.pyplot as plt
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DeiT training and evaluation script', add_help=False)
     parser.add_argument('--batch-size', default=64, type=int)
-    parser.add_argument('--epochs', default=80, type=int)
+    parser.add_argument('--epochs', default=10, type=int)
 
     # Model parameters
     parser.add_argument('--model', default='deit_base_patch16_224', type=str, metavar='MODEL',
@@ -168,19 +168,23 @@ def get_args_parser():
     parser.add_argument('--head_search', action='store_true')
     parser.add_argument('--uniform_search', action='store_true')
     parser.add_argument('--freeze_weights', action='store_true')
-    parser.add_argument('--pre_epochs', default=10, type=int, help='epochs for pre sparse')
-    parser.add_argument('--fs_epochs', default=20, type=int, help='epochs for final sparse')
-    parser.add_argument('--ms_times', default=3, type=int, help='times for mix and sparse')
-    parser.add_argument('--m_epochs', default=10, type=int, help='epochs for mix')
-    parser.add_argument('--s_epochs', default=10, type=int, help='epochs for sparse')
+
+    parser.add_argument('--stage', default='pre_sparse', choices=['pre_sparse', 'middle_mix', 'middle_sparse', 'final_sparse'],
+                        type=str, help='training stage for early-remember-early-forget')
     parser.add_argument('--ft', default=0.1, type=float, help='threshold for forgetting')
     parser.add_argument('--rt', default=0.5, type=float, help='threshold for remembering')
+    parser.add_argument('--attn_bp_methods_filein', default='', type=str, help='attn bp_methods after last stage')
+    parser.add_argument('--mlp_bp_methods_filein', default='', type=str, help='mlp bp_methods after last stage')
+    parser.add_argument('--patch_bp_methods_filein', default='', type=str, help='patch bp_methods after last stage')
+    parser.add_argument('--attn_bp_methods_fileout', default='', type=str, help='attn bp_methods for next stage')
+    parser.add_argument('--mlp_bp_methods_fileout', default='', type=str, help='mlp bp_methods for next stage')
+    parser.add_argument('--patch_bp_methods_fileout', default='', type=str, help='patch bp_methods for next stage')
+    
     return parser
 
 
 def main(args):
     utils.init_distributed_mode(args)
-    args.epochs=args.pre_epochs+args.ms_times*2*(args.m_epochs+args.s_epochs)+args.fs_epochs
     print(args)
     args.w1/=args.world_size
     args.w2/=args.world_size
@@ -352,23 +356,28 @@ def main(args):
     init_w = [args.w1, args.w2, args.w3]
     
     zetas_attn, zetas_mlp, zetas_patch = model.module.give_zetas_layerwise() # [[[],[],...], [[],[],...], [[],[],...]]
+    # bp_methods for zetas: -1: w*||z||; 1: w*||z-1||; 0: w*||z||+L(accuracy)
+    if args.stage == 'pre_sparse':
+        bp_methods_attn = [[0 for x in range(len(n))] for n in zetas_attn]
+        bp_methods_mlp = [[0 for x in range(len(n))] for n in zetas_mlp]
+        bp_methods_patch = [[0 for x in range(len(n))] for n in zetas_patch]
+    else:
+        bp_methods_attn = read_list_2d_int(args.attn_bp_methods_filein)
+        bp_methods_mlp = read_list_2d_int(args.mlp_bp_methods_filein)
+        bp_methods_patch = read_list_2d_int(args.patch_bp_methods_filein)
+    bp_methods = [bp_methods_attn, bp_methods_mlp, bp_methods_patch]
+    
     # grad_masks for partial bp of zetas
     grad_masks_attn = [[1 for x in range(len(n))] for n in zetas_attn]
     grad_masks_mlp = [[1 for x in range(len(n))] for n in zetas_mlp]
     grad_masks_patch = [[1 for x in range(len(n))] for n in zetas_patch]
     grad_masks = [grad_masks_attn, grad_masks_mlp, grad_masks_patch]
 
-    # bp_methods for zetas: -1: w*||z||; 1: w*||z-1||; 0: w*||z||+L(accuracy)
-    bp_methods_attn = [[0 for x in range(len(n))] for n in zetas_attn]
-    bp_methods_mlp = [[0 for x in range(len(n))] for n in zetas_mlp]
-    bp_methods_patch = [[0 for x in range(len(n))] for n in zetas_patch]
-    bp_methods = [bp_methods_attn, bp_methods_mlp, bp_methods_patch]
-
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
-        if epoch<args.pre_epochs:
-            # pre sparse stage, finished
+        if args.stage == 'pre_sparse':
+            # stage: pre_sparse
             criterion_train = SearchingDistillationLossChannelWise(
                 criterion, device, w=w
             )
@@ -377,54 +386,32 @@ def main(args):
                 optimizer, device, epoch, loss_scaler,
                 args.clip_grad, model_ema, mixup_fn, use_amp=False
             )
-        elif epoch>=args.epochs-args.fs_epochs:
-            # final sparse stage, finished
-            if epoch == args.epochs-args.fs_epochs:
-                # update bp_methods
-                zetas_attn, zetas_mlp, zetas_patch = model.module.give_zetas_layerwise() # [[[],[],...], [[],[],...], [[],[],...]]
-                bp_methods = update_bp_methods(zetas_attn, zetas_mlp, zetas_patch, bp_methods, args.ft, args.ft)
-                # generate coefficients for losses
-                w_accuracy = generate_criterion_w(bp_methods, init_w, 0)
-                w_regzero = generate_criterion_w(bp_methods, init_w, -1)
-                w_regone = generate_criterion_w(bp_methods, init_w, 1)
-                # generate masks for partial regularization bp
-                grad_masks = update_grad_masks(grad_masks, bp_methods)
-                # generate losses
-                criterion_accuracy = SearchingDistillationLossChannelWise(criterion, device, w=w_accuracy)
-                criterion_regzero = LossRegZero(device, w=w_regzero)
-                criterion_regone = LossRegOne(device, w=w_regone)
-            # train
-            train_stats = train_one_epoch_partialbp(
-                model, criterion_accuracy, criterion_regzero, 
-                criterion_regone, grad_masks, data_loader_train,
-                optimizer, optimizer0, optimizer1, device, epoch, loss_scaler,
-                args.clip_grad, model_ema, mixup_fn, use_amp=False
-            )
-        elif ((epoch-args.pre_epochs)//10)%2 == 0:
-            # middle mix stage
-            if (epoch-args.pre_epochs)%(args.m_epochs+args.s_epochs) == 0:
-                # update bp_methods
-                zetas_attn, zetas_mlp, zetas_patch = model.module.give_zetas_layerwise() # [[[],[],...], [[],[],...], [[],[],...]]
-                bp_methods = update_bp_methods(zetas_attn, zetas_mlp, zetas_patch, bp_methods, args.ft, args.rt)
-                # generate coefficients for losses
-                w_accuracy = generate_criterion_w(bp_methods, init_w, 0)
-                w_regzero = generate_criterion_w(bp_methods, init_w, -1)
-                w_regone = generate_criterion_w(bp_methods, init_w, 1)
-                # generate masks for partial regularization bp
-                grad_masks = update_grad_masks(grad_masks, bp_methods)
-                # generate losses
-                criterion_accuracy = criterion
-                criterion_regzero = LossRegZero(device, w=w_regzero)
-                criterion_regone = LossRegOne(device, w=w_regone)
-            # train
-            train_stats = train_one_epoch_partialbp(
-                model, criterion_accuracy, criterion_regzero, 
-                criterion_regone, grad_masks, data_loader_train,
-                optimizer, optimizer0, optimizer1, device, epoch, loss_scaler,
-                args.clip_grad, model_ema, mixup_fn, use_amp=False
-            )
         else:
-            # middle sparse stage
+            # stage: middle_mix / middle_sparse / final_sparse
+            if epoch == 0:
+                # update bp_methods
+                zetas_attn, zetas_mlp, zetas_patch = model.module.give_zetas_layerwise() # [[[],[],...], [[],[],...], [[],[],...]]
+                if args.stage == 'final_sparse':
+                    bp_methods = update_bp_methods(zetas_attn, zetas_mlp, zetas_patch, bp_methods, args.ft, args.ft)
+                else:
+                    bp_methods = update_bp_methods(zetas_attn, zetas_mlp, zetas_patch, bp_methods, args.ft, args.rt)
+                
+                # generate coefficients for losses
+                w_accuracy = generate_criterion_w(bp_methods, init_w, 0)
+                w_regzero = generate_criterion_w(bp_methods, init_w, -1)
+                w_regone = generate_criterion_w(bp_methods, init_w, 1)
+                
+                # generate masks for partial regularization bp
+                grad_masks = update_grad_masks(grad_masks, bp_methods)
+                
+                # generate losses
+                if args.stage == 'middle_mix':
+                    criterion_accuracy = criterion
+                else:
+                    criterion_accuracy = SearchingDistillationLossChannelWise(criterion, device, w=w_accuracy)
+                criterion_regzero = LossRegZero(device, w=w_regzero)
+                criterion_regone = LossRegOne(device, w=w_regone)
+            
             # train
             train_stats = train_one_epoch_partialbp(
                 model, criterion_accuracy, criterion_regzero, 
@@ -485,6 +472,10 @@ def main(args):
         #    model.module.update_zetas_SA(zetas_search)
 
         #pre_zetas = cur_zetas
+
+    save_list_2d_int(bp_methods[0], args.attn_bp_methods_fileout)
+    save_list_2d_int(bp_methods[1], args.mlp_bp_methods_fileout)
+    save_list_2d_int(bp_methods[2], args.patch_bp_methods_fileout)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

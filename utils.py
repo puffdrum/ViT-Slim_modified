@@ -241,7 +241,34 @@ def init_distributed_mode(args):
     setup_for_distributed(args.rank == 0)
 
 
+def read_list_2d_int(filename):
+    file1 = open(filename+".txt", "r")
+    list_row =file1.readlines()
+    list_source = []
+    for i in range(len(list_row)):
+        column_list = list_row[i].strip().split("\t")
+        list_source.append(column_list)
+    for i in range(len(list_source)):
+        for j in range(len(list_source[i])):
+            list_source[i][j]=int(list_source[i][j])
+    file1.close()
+    return list_source
+
+
+def save_list_2d_int(list1, filename):
+    file2 = open(filename + '.txt', 'w')
+    for i in range(len(list1)):
+        for j in range(len(list1[i])):
+            file2.write(str(list1[i][j]))
+            file2.write('\t')
+        file2.write('\n')
+    file2.close()
+
+
 def simulated_annealing_sparse_layerwise(pre_pis, cur_pis, w, cur_epoch, total_epochs):
+    """
+    This function updates layerwise regulation coefficient
+    """
     pre_sum = 0
     cur_sum = 0
     for i in range(len(w)):
@@ -274,6 +301,9 @@ def simulated_annealing_sparse_layerwise(pre_pis, cur_pis, w, cur_epoch, total_e
 
 
 def simulated_annealing_sparse_channelwise(pre_pis, cur_pis, w, cur_epoch, total_epochs):
+    """
+    This function updates channelwise regulation coefficient
+    """
     pre_sum = 0
     cur_sum = 0
     for i in range(len(w)):
@@ -305,6 +335,9 @@ def simulated_annealing_sparse_channelwise(pre_pis, cur_pis, w, cur_epoch, total
     return w
 
 def update_bp_methods(zetas_attn, zetas_mlp, zetas_patch, bp_methods, ft, rt):
+    """
+    This function updates back-propagation methods for zetas
+    """
     for layer in range(len(zetas_attn)):
         for index in range(len(zetas_attn[layer])):
             if bp_methods[0][layer][index] == 0:
@@ -330,6 +363,9 @@ def update_bp_methods(zetas_attn, zetas_mlp, zetas_patch, bp_methods, ft, rt):
     return bp_methods
 
 def generate_criterion_w(bp_methods, w, value):
+    """
+    This function generates regulation coeeficients based on back-propagation methods for zetas
+    """
     w_train = []
     w_train_attn = [w[0] if method == value else 0 for methods in bp_methods[0] for method in methods]
     w_train_mlp = [w[1] if method == value else 0 for methods in bp_methods[1] for method in methods]
@@ -341,13 +377,17 @@ def generate_criterion_w(bp_methods, w, value):
     return w_train
 
 def update_grad_masks(grad_masks, bp_methods):
+    """
+    This function updates grad_masks for zetas
+    """
     for layers in range(len(bp_methods)):
         for layer in range(len(bp_methods[layers])):
             for channel in range(len(bp_methods[layers][layer])):
-                if bp_methods[layers][layer][channel] == 0:
-                    grad_masks[layers][layer][channel] = 1
-                else:
+                if bp_methods[layers][layer][channel] != 0:
                     grad_masks[layers][layer][channel] = 0
 
     return grad_masks
+
+
+
 
