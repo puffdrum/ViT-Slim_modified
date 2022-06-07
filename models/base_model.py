@@ -275,6 +275,21 @@ class BaseModel(nn.Module):
         self.compress_patch(thresh_patch)
         return thresh_attn, thresh_mlp, 0
     
+    def compress_with_thresh(self, thresh_attn, thresh_mlp, thresh_patch):
+        """compress the network with fixed threshold to make zeta exactly 1 and 0"""
+        if self.searchable_modules == []:
+            self.searchable_modules = [m for m in self.modules() if hasattr(m, 'zeta')]
+        # thresh_attn, thresh_mlp, thresh_patch = self.calculate_search_threshold(budget_attn, budget_mlp, budget_patch)
+                
+        for l_block in self.searchable_modules:
+            if hasattr(l_block, 'num_heads'):
+                l_block.compress(thresh_attn)
+            else:
+                l_block.compress(thresh_mlp)
+        self.compress_patch(thresh_patch)
+        # return thresh_attn, thresh_mlp, 0
+        return thresh_attn, thresh_mlp, thresh_patch
+    
     def compress_patch(self, threshold):
         zetas = []
         for l_block in self.searchable_modules:
